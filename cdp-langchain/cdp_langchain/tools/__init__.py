@@ -1,5 +1,5 @@
-"""CDP Tool."""
-
-from cdp_langchain.tools.cdp_tool import CdpTool
-
-__all__ = ["CdpTool"]
+try:
+    import cdp_langchain.tools.get_real_data.GetRealDataTool
+    print("Import successful!")
+except ModuleNotFoundError as e:
+    print(f"Error: {e}")
