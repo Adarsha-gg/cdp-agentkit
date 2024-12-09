@@ -11,6 +11,7 @@ from pydantic import BaseModel, model_validator
 from cdp import Wallet
 from cdp_langchain import __version__
 from cdp_langchain.constants import CDP_LANGCHAIN_DEFAULT_SOURCE
+from cdp_agentkit_core.actions import (get_token_price)
 
 
 class CdpAgentkitWrapper(BaseModel):
