@@ -15,6 +15,128 @@ import requests
 from typing import Optional
 from pydantic import BaseModel, Field
 
+from chainlink.ccip import CrossChainMessenger, MessageType
+
+CROSS_CHAIN_SWAP_PROMPT = """
+Perform a cross-chain token swap using Chainlink's Cross-Chain Interoperability Protocol (CCIP).
+This action enables secure token transfers and swaps between different blockchain networks.
+"""
+
+class CrossChainSwapInput(BaseModel):
+    """Input schema for cross-chain swap action."""
+
+    source_token_address: str = Field(
+        ..., 
+        description="Contract address of the source token to swap from",
+        example="0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984"  # Uniswap token
+    )
+    destination_token_address: str = Field(
+        ..., 
+        description="Contract address of the destination token to swap to",
+        example="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # USDC
+    )
+    amount: float = Field(
+        ..., 
+        description="Amount of tokens to swap",
+        example=100.0
+    )
+    source_network_id: int = Field(
+        ..., 
+        description="Source blockchain network ID (Chainlink CCIP router network)",
+        example=1  # Ethereum mainnet
+    )
+    destination_network_id: int = Field(
+        ..., 
+        description="Destination blockchain network ID (Chainlink CCIP router network)", 
+        example=137  # Polygon
+    )
+    destination_wallet_address: str = Field(
+        ...,
+        description="Wallet address on the destination network to receive tokens",
+        example="0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
+    )
+    slippage_tolerance: Optional[float] = Field(
+        default=0.01,
+        description="Maximum acceptable slippage percentage",
+        example=0.01  # 1% slippage
+    )
+
+def cross_chain_swap(
+    wallet: Wallet, 
+    source_token_address: str,
+    destination_token_address: str,
+    amount: float,
+    source_network_id: int,
+    destination_network_id: int,
+    destination_wallet_address: str,
+    slippage_tolerance: float = 0.01
+) -> str:
+    """
+    Perform a cross-chain token swap using Chainlink's Cross-Chain Interoperability Protocol (CCIP).
+    
+    Args:
+        wallet (Wallet): Source wallet for the swap
+        source_token_address (str): Token contract address to swap from
+        destination_token_address (str): Token contract address to swap to
+        amount (float): Amount of tokens to swap
+        source_network_id (int): Source blockchain network ID (Chainlink CCIP router network)
+        destination_network_id (int): Destination blockchain network ID (Chainlink CCIP router network)
+        destination_wallet_address (str): Wallet address on destination network to receive tokens
+        slippage_tolerance (float, optional): Maximum acceptable price slippage. Defaults to 0.01 (1%).
+    
+    Returns:
+        str: Cross-chain swap transaction details and confirmation
+    """
+    try:
+        # Initialize Chainlink Cross-Chain Messenger
+        ccip_messenger = CrossChainMessenger(
+            source_network_id=source_network_id,
+            destination_network_id=destination_network_id
+        )
+
+        # Fetch current swap quote and validate
+        swap_quote = ccip_messenger.get_quote(
+            source_token=source_token_address,
+            destination_token=destination_token_address,
+            amount=amount,
+            slippage_tolerance=slippage_tolerance
+        )
+
+        # Approve token spending for CCIP router
+        wallet.approve_token_spending(
+            token_address=source_token_address, 
+            amount=amount,
+            spender=ccip_messenger.router_address
+        )
+
+        # Execute cross-chain transfer
+        ccip_message = ccip_messenger.send_message(
+            receiver_address=destination_wallet_address,
+            message_type=MessageType.TRANSFER_TOKEN,
+            payload={
+                "token_in": source_token_address,
+                "token_out": destination_token_address,
+                "amount": amount
+            }
+        )
+
+        # Wait for message confirmation
+        message_status = ccip_message.wait_for_confirmation()
+
+        return f"""
+        Chainlink CCIP Cross-Chain Swap Completed:
+        - From: {source_token_address} (Network {source_network_id})
+        - To: {destination_token_address} (Network {destination_network_id})
+        - Amount: {amount}
+        - Destination Wallet: {destination_wallet_address}
+        - CCIP Message ID: {ccip_message.message_id}
+        - Transaction Status: {message_status}
+        """
+    
+    except Exception as e:
+        logging.error(f"Cross-chain swap failed: {str(e)}")
+        return f"Cross-chain swap failed: {str(e)}"
+
 PRICE_TOOL_DESCRIPTION = """
 Tool for retrieving real-time cryptocurrency token prices. 
 Supports fetching current market data including price, market cap, and 24-hour price change.
@@ -64,35 +186,16 @@ def get_token_price(token_identifier: str, currency: str = "USD") -> dict:
 
         # Extract price information
         token_data = list(data.values())[0] if data else {}
-        return {
-            "price": token_data.get(f"{currency.lower()}"),
-            "market_cap": token_data.get(f"{currency.lower()}_market_cap"),
-            "24h_change": token_data.get(f"{currency.lower()}_24h_change"),
-            "token": token_identifier
-        }
+        result = f"""" Details for {token_identifier}:
+            Price: {token_data.get(f"{currency.lower()}")} {currency}
+            Market Cap: {token_data.get(f"{currency.lower()}_market_cap")} {currency}
+                    """
+        return result
 
     except requests.RequestException as e:
         return {"error": f"API request failed: {str(e)}"}
 
-def run_token_price_tool(token_identifier: str, currency: str = "USD") -> str:
-    """Wrapper function to run the token price tool and format output.
 
-    Args:
-        token_identifier (str): Token symbol or contract address to fetch price for.
-        currency (str, optional): Target currency for price conversion. Defaults to "USD".
-
-    Returns:
-        str: Formatted string with token price information.
-    """
-    result = get_token_price(token_identifier, currency)
-    
-    if "error" in result:
-        return result["error"]
-    
-    return f"""Token Price Information for {token_identifier}:
-Price: {result['price']} {currency}
-Market Cap: {result['market_cap']} {currency}
-24h Change: {result['24h_change']}%"""
 
 # Configure a file to persist the agent's CDP MPC Wallet Data.
 wallet_data_file = "wallet_data.txt"
@@ -130,7 +233,7 @@ def initialize_agent():
         name="token_price",
         description=PRICE_TOOL_DESCRIPTION,
         cdp_agentkit_wrapper=agentkit,
-        func=run_token_price_tool,
+        func=get_token_price,
         args_schema=TokenPriceTool,
     )
 
