@@ -2,6 +2,10 @@ import os
 import sys
 import time
 
+import requests
+from typing import Optional,Dict, Any
+from pydantic import BaseModel, Field
+import base64
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
@@ -11,131 +15,108 @@ from langgraph.prebuilt import create_react_agent
 from cdp_langchain.agent_toolkits import CdpToolkit
 from cdp_langchain.utils import CdpAgentkitWrapper
 from cdp_langchain.tools import CdpTool
-import requests
-from typing import Optional
-from pydantic import BaseModel, Field
 
-from chainlink.ccip import CrossChainMessenger, MessageType
-
-CROSS_CHAIN_SWAP_PROMPT = """
-Perform a cross-chain token swap using Chainlink's Cross-Chain Interoperability Protocol (CCIP).
-This action enables secure token transfers and swaps between different blockchain networks.
+ETHERSCAN_WALLET_SEARCH_PROMPT = """
+This tool searches Etherscan for all transactions (trades, swaps, transfers) associated with a given Ethereum wallet address. It retrieves a summary of recent transaction activities across different protocols and token types.
 """
 
-class CrossChainSwapInput(BaseModel):
-    """Input schema for cross-chain swap action."""
+class EtherscanWalletSearchInput(BaseModel):
+    """Input argument schema for Etherscan wallet transaction search."""
 
-    source_token_address: str = Field(
-        ..., 
-        description="Contract address of the source token to swap from",
-        example="0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984"  # Uniswap token
-    )
-    destination_token_address: str = Field(
-        ..., 
-        description="Contract address of the destination token to swap to",
-        example="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # USDC
-    )
-    amount: float = Field(
-        ..., 
-        description="Amount of tokens to swap",
-        example=100.0
-    )
-    source_network_id: int = Field(
-        ..., 
-        description="Source blockchain network ID (Chainlink CCIP router network)",
-        example=1  # Ethereum mainnet
-    )
-    destination_network_id: int = Field(
-        ..., 
-        description="Destination blockchain network ID (Chainlink CCIP router network)", 
-        example=137  # Polygon
-    )
-    destination_wallet_address: str = Field(
+    wallet_address: str = Field(
         ...,
-        description="Wallet address on the destination network to receive tokens",
+        description="The Ethereum wallet address to search for transactions (e.g., '0x742d35Cc6634C0532925a3b844Bc454e4438f44e')",
         example="0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
     )
-    slippage_tolerance: Optional[float] = Field(
-        default=0.01,
-        description="Maximum acceptable slippage percentage",
-        example=0.01  # 1% slippage
+    api_key: str = Field(
+        ...,
+        description="API key for accessing transaction data",
+        example="YOUR_ETHERSCAN_API_KEY"
+    )
+    max_transactions: int = Field(
+        default=50,
+        description="Maximum number of transactions to retrieve",
+        ge=1,
+        le=1000
     )
 
-def cross_chain_swap(
-    wallet: Wallet, 
-    source_token_address: str,
-    destination_token_address: str,
-    amount: float,
-    source_network_id: int,
-    destination_network_id: int,
-    destination_wallet_address: str,
-    slippage_tolerance: float = 0.01
-) -> str:
+def search_wallet_transactions(wallet_address: str, api_key: str, max_transactions: int = 50) -> str:
     """
-    Perform a cross-chain token swap using Chainlink's Cross-Chain Interoperability Protocol (CCIP).
-    
+    Search for transactions associated with a specific wallet address.
+
     Args:
-        wallet (Wallet): Source wallet for the swap
-        source_token_address (str): Token contract address to swap from
-        destination_token_address (str): Token contract address to swap to
-        amount (float): Amount of tokens to swap
-        source_network_id (int): Source blockchain network ID (Chainlink CCIP router network)
-        destination_network_id (int): Destination blockchain network ID (Chainlink CCIP router network)
-        destination_wallet_address (str): Wallet address on destination network to receive tokens
-        slippage_tolerance (float, optional): Maximum acceptable price slippage. Defaults to 0.01 (1%).
-    
+        wallet_address (str): Ethereum wallet address to search.
+        api_key (str):  API key.
+        max_transactions (int, optional): Maximum number of transactions to retrieve. Defaults to 50.
+
     Returns:
-        str: Cross-chain swap transaction details and confirmation
+        str: Summarized transaction information.
+    """
+    # Etherscan API endpoints
+
+    API_KEY = api_key
+    encoded_key = base64.b64encode(API_KEY.encode()).decode()
+
+    query = """
+    query providerPorfolioQuery($addresses: [Address!]!, $networks: [Network!]!) {
+    portfolio(addresses: $addresses, networks: $networks) {
+        tokenBalances {
+        address
+        network
+        token {
+            balance
+            balanceUSD
+            baseToken {
+            name
+            symbol
+            }
+        }
+        }
+    }
+    }
     """
     try:
-        # Initialize Chainlink Cross-Chain Messenger
-        ccip_messenger = CrossChainMessenger(
-            source_network_id=source_network_id,
-            destination_network_id=destination_network_id
+        response = requests.post(
+            'https://public.zapper.xyz/graphql',
+            headers={
+                'Content-Type': 'application/json',
+                'Authorization': f'Basic {encoded_key}'
+            },
+            json={
+                'query': query,
+                'variables': {
+                    'addresses': [wallet_address],
+                    'networks': ['ETHEREUM_MAINNET','POLYGON_MAINNET','BINANCE_SMART_CHAIN_MAINNET']
+                }
+            },
+            timeout=30
         )
 
-        # Fetch current swap quote and validate
-        swap_quote = ccip_messenger.get_quote(
-            source_token=source_token_address,
-            destination_token=destination_token_address,
-            amount=amount,
-            slippage_tolerance=slippage_tolerance
-        )
+        response.raise_for_status()
+        data = response.json()
 
-        # Approve token spending for CCIP router
-        wallet.approve_token_spending(
-            token_address=source_token_address, 
-            amount=amount,
-            spender=ccip_messenger.router_address
-        )
+        if 'errors' in data:
+            raise ValueError(f"GraphQL Errors: {data['errors']}")
 
-        # Execute cross-chain transfer
-        ccip_message = ccip_messenger.send_message(
-            receiver_address=destination_wallet_address,
-            message_type=MessageType.TRANSFER_TOKEN,
-            payload={
-                "token_in": source_token_address,
-                "token_out": destination_token_address,
-                "amount": amount
-            }
-        )
+        balance = data['data']['portfolio']['tokenBalances']
+        result = ''
+        for item in balance:
+            result += f"""Network:" {item["network"]}
+            Symbol: {item["token"]["baseToken"]["symbol"]}
+            Balance: {item["token"]["balance"]}
+            Balance USD: {item["token"]["balanceUSD"]}\n"""
 
-        # Wait for message confirmation
-        message_status = ccip_message.wait_for_confirmation()
+        return result    
 
-        return f"""
-        Chainlink CCIP Cross-Chain Swap Completed:
-        - From: {source_token_address} (Network {source_network_id})
-        - To: {destination_token_address} (Network {destination_network_id})
-        - Amount: {amount}
-        - Destination Wallet: {destination_wallet_address}
-        - CCIP Message ID: {ccip_message.message_id}
-        - Transaction Status: {message_status}
-        """
-    
+    except requests.RequestException as e:
+        print(f"Request failed: {e}")
+        raise
+    except ValueError as e:
+        print(f"Data validation failed: {e}")
+        raise
     except Exception as e:
-        logging.error(f"Cross-chain swap failed: {str(e)}")
-        return f"Cross-chain swap failed: {str(e)}"
+        print(f"Unexpected error: {e}")
+        raise
 
 PRICE_TOOL_DESCRIPTION = """
 Tool for retrieving real-time cryptocurrency token prices. 
@@ -145,7 +126,6 @@ Can use token symbols or contract addresses.
 
 class TokenPriceTool(BaseModel):
     """Pydantic model for token price retrieval tool."""
-
     token_identifier: str = Field(
         ..., 
         description="Token name (e.g., 'Bitcoin', 'Ethereum') or contract address",
@@ -156,14 +136,12 @@ class TokenPriceTool(BaseModel):
         description="Target currency for price conversion",
         examples=["USD", "EUR", "GBP"]
     )
-
+    
 def get_token_price(token_identifier: str, currency: str = "USD") -> dict:
     """Retrieve real-time price information for a cryptocurrency token.
-
     Args:
         token_identifier (str): Token symbol or contract address to fetch price for.
         currency (str, optional): Target currency for price conversion. Defaults to "USD".
-
     Returns:
         dict: A dictionary containing token price information.
     """
@@ -175,15 +153,12 @@ def get_token_price(token_identifier: str, currency: str = "USD") -> dict:
         else:
             # Use token symbol lookup
             url = f"https://api.coingecko.com/api/v3/simple/price?ids={token_identifier}&vs_currencies=USD&include_market_cap=true&x_cg_demo_api_key=CG-2pUQLuvdJhQVuWUuyGZ61kRS"
-
         response = requests.get(url)
         response.raise_for_status()
         data = response.json()
-
         # Process and format the response
         if not data:
             return {"error": "Token not found"}
-
         # Extract price information
         token_data = list(data.values())[0] if data else {}
         result = f"""" Details for {token_identifier}:
@@ -191,11 +166,8 @@ def get_token_price(token_identifier: str, currency: str = "USD") -> dict:
             Market Cap: {token_data.get(f"{currency.lower()}_market_cap")} {currency}
                     """
         return result
-
     except requests.RequestException as e:
         return {"error": f"API request failed: {str(e)}"}
-
-
 
 # Configure a file to persist the agent's CDP MPC Wallet Data.
 wallet_data_file = "wallet_data.txt"
@@ -237,10 +209,18 @@ def initialize_agent():
         args_schema=TokenPriceTool,
     )
 
+    visualizer = CdpTool(
+        name="visualize_wallet",
+        description=ETHERSCAN_WALLET_SEARCH_PROMPT,
+        cdp_agentkit_wrapper=agentkit,
+        func=search_wallet_transactions,
+        args_schema=EtherscanWalletSearchInput,
+    )
     # Ensure tools is a list and add the new tool
     if tools is None:
         tools = []
     tools.append(realTool)
+    tools.append(visualizer)
 
     # Store buffered conversation history in memory.
     memory = MemorySaver()
@@ -298,6 +278,7 @@ def run_autonomous_mode(agent_executor, config, interval=10):
 
 # Chat Mode
 def run_chat_mode(agent_executor, config):
+
     """Run the agent interactively based on user input."""
     print("Starting chat mode... Type 'exit' to end.")
     while True:
