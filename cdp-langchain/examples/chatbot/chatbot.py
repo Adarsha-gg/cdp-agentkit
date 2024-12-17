@@ -3,6 +3,10 @@ import sys
 import time
 import requests
 import base64
+import speech_recognition as sr
+import threading
+import logging
+import re
 
 from dotenv import load_dotenv
 from typing import Optional,Dict, Any
@@ -18,11 +22,7 @@ from cdp_langchain.agent_toolkits import CdpToolkit
 from cdp_langchain.utils import CdpAgentkitWrapper
 from cdp_langchain.tools import CdpTool
 
-import speech_recognition as sr
-import threading
-import logging
-import re
-import time
+
 
 class VoiceCommandHandler:
     def __init__(self, agent_executor, config):
@@ -138,7 +138,7 @@ WALLET_SEARCH_PROMPT = """
 This tool searches for all transactions (trades, swaps, transfers) associated with a given wallet address. It retrieves a summary of recent transaction activities across different protocols and token types.
 """
 
-class EtherscanWalletSearchInput(BaseModel):
+class WalletSearchInput(BaseModel):
     """Input argument schema for Etherscan wallet transaction search."""
 
     wallet_address: str = Field(
@@ -328,7 +328,7 @@ def initialize_agent():
         description=WALLET_SEARCH_PROMPT,
         cdp_agentkit_wrapper=agentkit,
         func=search_wallet_transactions,
-        args_schema=EtherscanWalletSearchInput,
+        args_schema=WalletSearchInput,
     )
     # Ensure tools is a list and add the new tool
     if tools is None:
