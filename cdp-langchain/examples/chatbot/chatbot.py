@@ -1,11 +1,13 @@
 import os
 import sys
 import time
-
 import requests
+import base64
+
+from dotenv import load_dotenv
 from typing import Optional,Dict, Any
 from pydantic import BaseModel, Field
-import base64
+
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
@@ -16,8 +18,124 @@ from cdp_langchain.agent_toolkits import CdpToolkit
 from cdp_langchain.utils import CdpAgentkitWrapper
 from cdp_langchain.tools import CdpTool
 
-ETHERSCAN_WALLET_SEARCH_PROMPT = """
-This tool searches Etherscan for all transactions (trades, swaps, transfers) associated with a given Ethereum wallet address. It retrieves a summary of recent transaction activities across different protocols and token types.
+import speech_recognition as sr
+import threading
+import logging
+import re
+import time
+
+class VoiceCommandHandler:
+    def __init__(self, agent_executor, config):
+        self.recognizer = sr.Recognizer()
+        self.microphone = sr.Microphone()
+        self.is_listening = False
+        self.logger = logging.getLogger(__name__)
+        logging.basicConfig(level=logging.WARNING)  # Suppress detailed HTTP logs
+        self.agent_executor = agent_executor
+        self.config = config
+
+    def process_voice_command(self, command):
+        """
+        Process the recognized voice command using the agent executor.
+
+        Args:
+            command (str): Voice command to process.
+
+        Returns:
+            str: Agent's response to the command.
+        """
+        try:
+            response = ""
+            for chunk in self.agent_executor.stream(
+                 {"messages": [HumanMessage(content=command)]},
+                self.config
+            ):
+                if "agent" in chunk:
+                    response += chunk["agent"]["messages"][0].content
+                elif "tools" in chunk:
+                    response += chunk["tools"]["messages"][0].content
+                 
+
+            return self.format_response(response)
+        except Exception as e:
+            error_msg = f"Error processing command: {e}"
+            self.logger.error(error_msg)
+            return error_msg
+
+    def format_response(self, response):
+        """
+        Format the agent's response for better readability.
+
+        Args:
+            response (str): Raw response from the agent.
+
+        Returns:
+            str: Formatted response.
+        """
+        return "\n".join(line.strip() for line in response.split("\n") if line.strip())
+
+    def listen_and_respond(self):
+        """
+        Listen for voice commands and process them.
+        """
+        self.is_listening = True
+        print("Voice mode activated. Say 'exit' to end.")
+
+        while self.is_listening:
+            try:
+                with self.microphone as source:
+                    self.logger.info("Listening...")
+                    self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    audio = self.recognizer.listen(source, timeout=15, phrase_time_limit=15)
+
+                try:
+                    # Recognize speech
+                    command = self.recognizer.recognize_google(audio).lower()
+                    print(f"Command recognized: {command}")
+                    print("-------------------")   
+                    # Check for exit command
+                    if command == 'exit':
+                        print("Exiting voice mode. Goodbye!")
+                        self.is_listening = False
+                        break
+
+                    # Process the command
+                    response = self.process_voice_command(command)
+
+                    # Print the response
+                    print(f"\n{response}\n")
+                    print("-------------------")   
+
+                except sr.UnknownValueError:
+                    print("Sorry, I could not understand that. Could you please repeat?")
+                except sr.RequestError:
+                    print("Speech recognition service is unavailable. Please try again later.")
+
+            except Exception as e:
+                self.logger.error(f"Unexpected error in voice processing: {e}")
+                print("An unexpected error occurred. Please try again.")
+
+    def start(self):
+        """
+        Start the voice command listener in a separate thread.
+        """
+        listener_thread = threading.Thread(target=self.listen_and_respond, daemon=True)
+        listener_thread.start()
+        return listener_thread
+
+    def stop(self):
+        """
+        Stop the voice command listener.
+        """
+        self.is_listening = False
+        print("Voice command listener stopped.")
+
+
+
+load_dotenv()
+
+WALLET_SEARCH_PROMPT = """
+This tool searches for all transactions (trades, swaps, transfers) associated with a given wallet address. It retrieves a summary of recent transaction activities across different protocols and token types.
 """
 
 class EtherscanWalletSearchInput(BaseModel):
@@ -28,11 +146,6 @@ class EtherscanWalletSearchInput(BaseModel):
         description="The Ethereum wallet address to search for transactions (e.g., '0x742d35Cc6634C0532925a3b844Bc454e4438f44e')",
         example="0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
     )
-    api_key: str = Field(
-        ...,
-        description="API key for accessing transaction data",
-        example="YOUR_ETHERSCAN_API_KEY"
-    )
     max_transactions: int = Field(
         default=50,
         description="Maximum number of transactions to retrieve",
@@ -40,7 +153,7 @@ class EtherscanWalletSearchInput(BaseModel):
         le=1000
     )
 
-def search_wallet_transactions(wallet_address: str, api_key: str, max_transactions: int = 50) -> str:
+def search_wallet_transactions(wallet_address: str, max_transactions: int = 50) -> str:
     """
     Search for transactions associated with a specific wallet address.
 
@@ -54,7 +167,7 @@ def search_wallet_transactions(wallet_address: str, api_key: str, max_transactio
     """
     # Etherscan API endpoints
 
-    API_KEY = api_key
+    API_KEY = os.getenv('WALLET_API_KEY')
     encoded_key = base64.b64encode(API_KEY.encode()).decode()
 
     query = """
@@ -136,7 +249,7 @@ class TokenPriceTool(BaseModel):
         description="Target currency for price conversion",
         examples=["USD", "EUR", "GBP"]
     )
-    
+
 def get_token_price(token_identifier: str, currency: str = "USD") -> dict:
     """Retrieve real-time price information for a cryptocurrency token.
     Args:
@@ -145,14 +258,15 @@ def get_token_price(token_identifier: str, currency: str = "USD") -> dict:
     Returns:
         dict: A dictionary containing token price information.
     """
+    Api = os.getenv('COINGECKO_API_KEY')
     try:
         # Determine if input is a contract address or a token symbol
         if token_identifier.startswith('0x'):
             # Use contract address lookup
-            url = f"https://api.coingecko.com/CG-2pUQLuvdJhQVuWUuyGZ61kRS/v3/simple/token_price/ethereum?contract_addresses={token_identifier}&vs_currencies=USD&include_market_cap=true&include_24hr_change=true"
+            url = f"https://api.coingecko.com/api/v3/simple/token_price/id={token_identifier}include_market_cap=true&include_24hr_vol=true&include_24hr_change=true&x_cg_demo_api_key={Api}"
         else:
             # Use token symbol lookup
-            url = f"https://api.coingecko.com/api/v3/simple/price?ids={token_identifier}&vs_currencies=USD&include_market_cap=true&x_cg_demo_api_key=CG-2pUQLuvdJhQVuWUuyGZ61kRS"
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={token_identifier}&vs_currencies=USD&include_market_cap=true&x_cg_demo_api_key={Api}"
         response = requests.get(url)
         response.raise_for_status()
         data = response.json()
@@ -211,7 +325,7 @@ def initialize_agent():
 
     visualizer = CdpTool(
         name="visualize_wallet",
-        description=ETHERSCAN_WALLET_SEARCH_PROMPT,
+        description=WALLET_SEARCH_PROMPT,
         cdp_agentkit_wrapper=agentkit,
         func=search_wallet_transactions,
         args_schema=EtherscanWalletSearchInput,
@@ -219,6 +333,7 @@ def initialize_agent():
     # Ensure tools is a list and add the new tool
     if tools is None:
         tools = []
+
     tools.append(realTool)
     tools.append(visualizer)
 
@@ -226,6 +341,7 @@ def initialize_agent():
     memory = MemorySaver()
     config = {"configurable": {"thread_id": "CDP Agentkit Chatbot Example!"}}
 
+    
     # Create ReAct Agent using the LLM and CDP Agentkit tools.
     return create_react_agent(
         llm,
@@ -241,6 +357,7 @@ def initialize_agent():
             "you must say so, and encourage them to implement it themselves using the CDP SDK + Agentkit, "
             "recommend they go to docs.cdp.coinbase.com for more information. Be concise and helpful with your "
             "responses. Refrain from restating your tools' descriptions unless it is explicitly requested."
+            "Always present your answers in a clear and concise formatted manner."
         ),
 
     ), config
@@ -301,6 +418,30 @@ def run_chat_mode(agent_executor, config):
             print("Goodbye Agent!")
             sys.exit(0)
 
+# Voice mode
+def run_voice_mode(agent_executor, config):
+    """
+    Run the agent interactively based on voice input.
+    
+    Args:
+        agent_executor: Agent executor instance.
+        config: Agent configuration.
+    """
+    try:
+        voice_handler = VoiceCommandHandler(agent_executor, config)
+        voice_thread = voice_handler.start()
+
+        # Keep the main thread running until voice thread completes
+        voice_thread.join()
+
+    except KeyboardInterrupt:
+        print("Voice mode interrupted.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"Error in voice mode: {e}")
+        sys.exit(1)
+
+
 
 # Mode Selection
 def choose_mode():
@@ -309,24 +450,29 @@ def choose_mode():
         print("\nAvailable modes:")
         print("1. chat    - Interactive chat mode")
         print("2. auto    - Autonomous action mode")
+        print("3. voice    - Interactive voice mode")
 
         choice = input("\nChoose a mode (enter number or name): ").lower().strip()
         if choice in ["1", "chat"]:
             return "chat"
         elif choice in ["2", "auto"]:
             return "auto"
+        elif choice in ["3", "voice"]:
+            return "voice"   
         print("Invalid choice. Please try again.")
 
 
 def main():
     """Start the chatbot agent."""
     agent_executor, config = initialize_agent()
-
+    
     mode = choose_mode()
     if mode == "chat":
         run_chat_mode(agent_executor=agent_executor, config=config)
     elif mode == "auto":
         run_autonomous_mode(agent_executor=agent_executor, config=config)
+    elif mode == "voice":
+        run_voice_mode(agent_executor=agent_executor, config=config)    
 
 
 if __name__ == "__main__":
