@@ -22,7 +22,62 @@ from cdp_langchain.agent_toolkits import CdpToolkit
 from cdp_langchain.utils import CdpAgentkitWrapper
 from cdp_langchain.tools import CdpTool
 
+from cdp import Wallet
+from pydantic import BaseModel, Field
+import qrcode
+from qrcode.main import QRCode
+from io import StringIO
 
+GENERATE_QR_PROMPT = """
+This tool generates a QR code for an MPC wallet address and displays it in the terminal. This is useful for quickly sharing wallet addresses for receiving assets or connecting to dApps."""
+
+
+class GenerateQrInput(BaseModel):
+    """Input argument schema for QR code generation action."""
+    
+    wallet_address: str = Field(
+        ...,
+        description="The wallet address to encode in the QR code",
+        example="0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+    )
+    
+    network: str = Field(
+        ...,
+        description="The network ID for the wallet address (e.g., 'ETHEREUM_MAINNET', 'POLYGON_MAINNET', 'BINANCE_SMART_CHAIN_MAINNET')",
+        example="ETHEREUM_MAINNET"
+    )
+
+def generate_qr(wallet: Wallet, wallet_address: str, network: str) -> str:
+    """Generate a QR code for a wallet address and display it in the terminal.
+    
+    Args:
+        wallet (Wallet): The wallet instance (used for validation).
+        wallet_address (str): The wallet address to encode in the QR code.
+        
+    Returns:
+        str: ASCII representation of the QR code along with the encoded address.
+    """
+    # Create QR code instance
+    qr = QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=1,
+        border=1,
+    )
+    
+    # Add data
+    qr.add_data(f"{network}:{wallet_address}")
+    qr.make(fit=True)
+    
+    # Create string buffer to capture ASCII output
+    f = StringIO()
+    qr.print_ascii(out=f)
+    f.seek(0)
+    
+    # Get ASCII QR code
+    qr_ascii = f.read()
+    
+    return f"QR Code for wallet address {wallet_address}:\n\n{qr_ascii}"
 
 class VoiceCommandHandler:
     def __init__(self, agent_executor, config):
@@ -330,12 +385,22 @@ def initialize_agent():
         func=search_wallet_transactions,
         args_schema=WalletSearchInput,
     )
+
+    qr_code = CdpTool(
+        name="qr_code",
+        description=GENERATE_QR_PROMPT,
+        cdp_agentkit_wrapper=agentkit,
+        func=generate_qr,
+        args_schema=GenerateQrInput,
+    )
+
     # Ensure tools is a list and add the new tool
     if tools is None:
         tools = []
 
     tools.append(realTool)
     tools.append(visualizer)
+    tools.append(qr_code)
 
     # Store buffered conversation history in memory.
     memory = MemorySaver()
@@ -357,7 +422,7 @@ def initialize_agent():
             "you must say so, and encourage them to implement it themselves using the CDP SDK + Agentkit, "
             "recommend they go to docs.cdp.coinbase.com for more information. Be concise and helpful with your "
             "responses. Refrain from restating your tools' descriptions unless it is explicitly requested."
-            "Always present your answers in a clear and concise formatted manner."
+            
         ),
 
     ), config
